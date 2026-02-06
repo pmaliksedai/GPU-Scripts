@@ -97,9 +97,34 @@ print_status "Processing each GPU node pool..."
 # Step 2: Process each GPU node pool
 for OLD_POOL_NAME in "${GPU_POOLS[@]}"; do
     echo ""
+    
+    # Skip pools that are already MIG-enabled
+    if [[ "$OLD_POOL_NAME" == *"-mig-enabled"* ]]; then
+        print_warning "Skipping $OLD_POOL_NAME as it appears to be already MIG-enabled"
+        continue
+    fi
+    
+    # Calculate what the new pool name would be and skip if it already exists in the list
+    POTENTIAL_NEW_NAME="${OLD_POOL_NAME}-mig-enabled"
+    for EXISTING_POOL in "${GPU_POOLS[@]}"; do
+        if [[ "$EXISTING_POOL" == "$POTENTIAL_NEW_NAME" ]]; then
+            print_warning "Skipping $OLD_POOL_NAME as corresponding MIG pool $POTENTIAL_NEW_NAME already exists"
+            continue 2  # Continue outer loop
+        fi
+    done
+    
     print_status "=== Processing node pool: $OLD_POOL_NAME ==="
     
-    NEW_POOL_NAME="${OLD_POOL_NAME}-mig-enabled"
+    # Ensure new pool name is under 40 characters
+    CANDIDATE_NAME="${OLD_POOL_NAME}-mig-enabled"
+    if [ ${#CANDIDATE_NAME} -le 40 ]; then
+        NEW_POOL_NAME="$CANDIDATE_NAME"
+    else
+        # Truncate base name to fit 40 char limit with -mig-enabled suffix (12 chars)
+        MAX_BASE_LENGTH=$((40 - 12))
+        TRUNCATED_BASE="${OLD_POOL_NAME:0:$MAX_BASE_LENGTH}"
+        NEW_POOL_NAME="${TRUNCATED_BASE}-mig-enabled"
+    fi
     GPU_CLASS="$NEW_POOL_NAME"
     
     # Check if the current node pool has 0 nodes and skip if so
@@ -261,28 +286,39 @@ kubectl get nodes -l workload.gke.io/gpu-class="$GPU_CLASS" \
   -L nvidia.com/mig.config || print_warning "No MIG nodes found yet (may take time for nodes to be ready)"
 
 echo ""
-print_status "Step 6: Installing NVIDIA GPU Operator with DRA (if not already installed)"
-print_warning "This step installs the GPU operator cluster-wide. Only run once per cluster."
+print_status "Step 6: Installing NVIDIA DRA Driver (if not already installed)"
 
-read -p "Do you want to install the NVIDIA GPU Operator? (y/N): " install_operator
+# Check if DRA is supported in the cluster
+print_status "Checking for DRA support in the cluster..."
+if kubectl api-resources | grep -q "resourceclaims.*resource.k8s.io"; then
+    print_status "DRA support detected in cluster"
+    
+    read -p "Do you want to install the NVIDIA DRA Driver? (y/N): " install_dra
 
-if [[ $install_operator =~ ^[Yy]$ ]]; then
-    print_status "Adding NVIDIA Helm repository..."
-    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
-    helm repo update
+    if [[ $install_dra =~ ^[Yy]$ ]]; then
+        print_status "Adding NVIDIA Helm repository..."
+        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+        helm repo update
 
-    print_status "Installing GPU Operator..."
-    helm install gpu-operator nvidia/gpu-operator \
-      --namespace gpu-operator \
-      --create-namespace \
-      --set mig.strategy=mixed \
-      --set devicePlugin.enabled=false \
-      --set dra.enabled=true
+        print_status "Installing DRA Driver..."
+        helm install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
+          --version="25.8.1" \
+          --create-namespace \
+          --namespace nvidia-dra-driver-gpu \
+          --set resources.gpus.enabled=true \
+          --set gpuResourcesEnabledOverride=true \
+          --set nvidiaDriverRoot=/run/nvidia/driver
 
-    print_status "Verifying GPU Operator installation..."
-    kubectl get pods -n gpu-operator
+        print_status "Verifying DRA Driver installation..."
+        kubectl get pods -n nvidia-dra-driver-gpu
+    else
+        print_warning "Skipping DRA Driver installation"
+    fi
 else
-    print_warning "Skipping GPU Operator installation"
+    print_error "DRA (Dynamic Resource Allocation) is not supported in this cluster"
+    print_error "DRA requires Kubernetes 1.26+ with specific feature gates enabled"
+    print_warning "For GKE, you need to enable the DRA feature in cluster configuration"
+    print_warning "Skipping DRA Driver installation"
 fi
 
 # Step 7: Create ResourceClasses
@@ -337,7 +373,16 @@ fi
 print_status "Setup complete!"
 print_status "Summary of created files:"
 for OLD_POOL_NAME in "${GPU_POOLS[@]}"; do
-    NEW_POOL_NAME="${OLD_POOL_NAME}-mig-enabled"
+    # Ensure new pool name is under 40 characters
+    CANDIDATE_NAME="${OLD_POOL_NAME}-mig-enabled"
+    if [ ${#CANDIDATE_NAME} -le 40 ]; then
+        NEW_POOL_NAME="$CANDIDATE_NAME"
+    else
+        # Truncate base name to fit 40 char limit with -mig-enabled suffix (12 chars)
+        MAX_BASE_LENGTH=$((40 - 12))
+        TRUNCATED_BASE="${OLD_POOL_NAME:0:$MAX_BASE_LENGTH}"
+        NEW_POOL_NAME="${TRUNCATED_BASE}-mig-enabled"
+    fi
     echo "  - old-nodepool-${OLD_POOL_NAME}.yaml (original pool configuration)"
     echo "  - new-nodepool-${NEW_POOL_NAME}.yaml (new MIG-enabled pool configuration)"
 done
