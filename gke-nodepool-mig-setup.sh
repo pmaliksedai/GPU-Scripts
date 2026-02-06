@@ -25,15 +25,14 @@ print_error() {
 }
 
 # Check if required parameters are provided
-if [ $# -lt 3 ]; then
-    echo "Usage: $0 <CLUSTER_NAME> <REGION> <GPU_CLASS>"
-    echo "Example: $0 sedai-gpu-cluster us-central1 mig-dra"
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <CLUSTER_NAME> <REGION>"
+    echo "Example: $0 sedai-gpu-cluster us-central1"
     exit 1
 fi
 
 CLUSTER_NAME="$1"
 REGION="$2"
-GPU_CLASS="$3"
 
 print_status "Starting GKE Node Pool MIG setup for cluster: $CLUSTER_NAME"
 
@@ -50,6 +49,33 @@ gcloud container node-pools list \
     initialNodeCount,
     config.accelerators.acceleratorType
   )"
+
+# Check node count in each pool
+print_status "Checking node counts in GPU node pools..."
+while IFS= read -r pool_name; do
+    if [[ -n "$pool_name" ]]; then
+        node_count=$(gcloud container node-pools describe "$pool_name" --cluster "$CLUSTER_NAME" --region "$REGION" --format="value(initialNodeCount)")
+        
+        # Handle empty or null node count (treat as 0)
+        if [[ -z "$node_count" || "$node_count" == "" ]]; then
+            node_count=0
+        fi
+        
+        if [[ "$node_count" =~ ^[0-9]+$ ]]; then
+            if [ "$node_count" -eq 0 ]; then
+                print_warning "Node pool '$pool_name' has 0 nodes"
+            elif [ "$node_count" -gt 10 ]; then
+                print_warning "Node pool '$pool_name' has a high node count: $node_count nodes"
+            else
+                print_status "Node pool '$pool_name' has $node_count node(s)"
+            fi
+        fi
+    fi
+done < <(gcloud container node-pools list \
+  --cluster "$CLUSTER_NAME" \
+  --region "$REGION" \
+  --filter="config.accelerators:* AND (config.accelerators.acceleratorType~nvidia-tesla-a100 OR config.accelerators.acceleratorType~nvidia-tesla-a30 OR config.accelerators.acceleratorType~nvidia-h100 OR config.accelerators.acceleratorType~nvidia-l40s)" \
+  --format="value(name)")
 
 # Get list of GPU node pool names
 GPU_POOLS=($(gcloud container node-pools list \
@@ -74,6 +100,21 @@ for OLD_POOL_NAME in "${GPU_POOLS[@]}"; do
     print_status "=== Processing node pool: $OLD_POOL_NAME ==="
     
     NEW_POOL_NAME="${OLD_POOL_NAME}-mig-enabled"
+    GPU_CLASS="$NEW_POOL_NAME"
+    
+    # Check if the current node pool has 0 nodes and skip if so
+    CURRENT_NODE_COUNT=$(gcloud container node-pools describe "$OLD_POOL_NAME" --cluster "$CLUSTER_NAME" --region "$REGION" --format="value(initialNodeCount)")
+    
+    # Handle empty or null node count (treat as 0)
+    if [[ -z "$CURRENT_NODE_COUNT" || "$CURRENT_NODE_COUNT" == "" ]]; then
+        CURRENT_NODE_COUNT=0
+    fi
+    
+    if [ "$CURRENT_NODE_COUNT" -eq 0 ]; then
+        print_warning "Skipping node pool '$OLD_POOL_NAME' as it has 0 nodes"
+        print_status "=== Skipped processing $OLD_POOL_NAME (0 nodes) ==="
+        continue
+    fi
     
     print_status "Step 2a: Describing old node pool $OLD_POOL_NAME"
     gcloud container node-pools describe "$OLD_POOL_NAME" \
@@ -128,6 +169,17 @@ for OLD_POOL_NAME in "${GPU_POOLS[@]}"; do
 
     echo ""
     read -p "Press Enter to continue with creating the new MIG-enabled node pool for $OLD_POOL_NAME..."
+
+    # Check if new node pool already exists
+    print_status "Checking if node pool $NEW_POOL_NAME already exists..."
+    if gcloud container node-pools describe "$NEW_POOL_NAME" \
+        --cluster "$CLUSTER_NAME" \
+        --region "$REGION" \
+        --quiet > /dev/null 2>&1; then
+        print_warning "Node pool $NEW_POOL_NAME already exists. Skipping creation."
+        print_status "=== Skipped processing $OLD_POOL_NAME (pool already exists) ==="
+        continue
+    fi
 
     # Step 3: Create new node pool with MIG configuration
     print_status "Step 3: Creating new MIG-enabled node pool $NEW_POOL_NAME"
