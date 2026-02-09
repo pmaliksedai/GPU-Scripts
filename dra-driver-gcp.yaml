@@ -1,0 +1,19 @@
+nvidiaDriverRoot: /home/kubernetes/bin/nvidia/
+
+gpuResourcesEnabledOverride: true # Required to deploy GPU and MIG deviceclasses
+
+resources:
+  computeDomains:
+    enabled: false
+
+controller:
+  nodeSelector: null
+  affinity: null
+  tolerations: []
+
+kubeletPlugin:
+  priorityClassName: ""
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: Exists
+      effect: NoSchedule
