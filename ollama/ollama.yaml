@@ -1,0 +1,124 @@
+# ============================================================
+# Ollama on Kubernetes — Fixed for clusters with limited GPU
+# ============================================================
+# Changes from previous version:
+#   - Removed PVC, using emptyDir (models re-download on restart
+#     but no storage binding issues)
+#   - Added nodeSelector for GPU node
+#   - Added tolerations for GPU taints
+# ============================================================
+
+# --- 1. Namespace ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ollama
+
+---
+# --- 2. Deployment (no PVC needed) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      # ---- Target the GPU node ----
+      # OPTION A: Use a label (recommended)
+      # First label your GPU node:
+      #   kubectl label node <YOUR-GPU-NODE> gpu=true
+      # Then uncomment:
+      # nodeSelector:
+      #   gpu: "true"
+
+      # OPTION B: Pin to a specific node by name
+      # Uncomment and replace with your GPU node name:
+      # nodeName: <YOUR-GPU-NODE-NAME>
+
+      # ---- Tolerate GPU taints ----
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: "gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - name: http
+              containerPort: 11434
+              protocol: TCP
+          env:
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+            - name: OLLAMA_KEEP_ALIVE
+              value: "5m"
+            - name: OLLAMA_HOST
+              value: "0.0.0.0"
+            - name: PATH
+              value: /usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: LD_LIBRARY_PATH
+              value: /usr/local/nvidia/lib:/usr/local/nvidia/lib64
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+            limits:
+              nvidia.com/gpu: 1
+              memory: "8Gi"
+              cpu: "4000m"
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+      # ---- emptyDir instead of PVC (no storage class needed) ----
+      volumes:
+        - name: ollama-data
+          emptyDir:
+            sizeLimit: 20Gi
+
+---
+# --- 3. Service ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  type: ClusterIP
+  selector:
+    app: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: 11434
+      protocol: TCP

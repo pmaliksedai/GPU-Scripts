@@ -1,0 +1,312 @@
+# ============================================================
+# Ollama Load Generator — Sustains <30% GR Engine / SM usage
+# ============================================================
+# Strategy:
+#   - Sends short prompts with small num_predict (few tokens)
+#   - Adds a sleep gap between requests to create idle windows
+#   - The duty cycle (work vs sleep) controls SM utilization
+#   - Runs from a lightweight pod (no GPU needed for this pod,
+#     GPU work happens inside the Ollama pod)
+#
+# Tuning:
+#   DUTY_CYCLE=0.25 means ~25% of the time GPU is doing work
+#   Combine with small MAX_TOKENS and moderate SLEEP_SEC
+# ============================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-loadgen
+  namespace: ollama
+data:
+  loadgen.py: |
+    #!/usr/bin/env python3
+    """
+    Ollama load generator that targets <30% GR Engine / SM usage.
+
+    It works by controlling the duty cycle:
+      - Send a request (GPU active during inference)
+      - Sleep for a calculated gap (GPU idle)
+      - The ratio of active/total time ≈ SM utilization %
+
+    Automatically calibrates by measuring inference latency and
+    adjusting sleep to hit the target utilization.
+    """
+    import json
+    import os
+    import random
+    import time
+    import sys
+    import urllib.request
+    from collections import deque
+    from datetime import datetime, timezone
+
+    # --------------- Config ---------------
+    OLLAMA_URL       = os.getenv("OLLAMA_URL", "http://ollama.ollama.svc:11434")
+    MODEL            = os.getenv("MODEL", "qwen3:0.6b")
+    TARGET_UTIL      = float(os.getenv("TARGET_GPU_UTIL", "0.25"))  # 25% target
+    NUM_CTX          = int(os.getenv("NUM_CTX", "512"))
+    MAX_TOKENS       = int(os.getenv("MAX_TOKENS", "30"))           # short responses
+    CALIBRATION_REQS = int(os.getenv("CALIBRATION_REQS", "5"))
+    LOG_INTERVAL     = int(os.getenv("LOG_INTERVAL", "10"))
+
+    # Short prompts = short GPU bursts
+    PROMPTS = [
+        "What is 2+2?",
+        "Name a color.",
+        "Say hello.",
+        "What is HTTP?",
+        "Name a planet.",
+        "One word for fast.",
+        "What is RAM?",
+        "Say yes or no.",
+        "Name a fruit.",
+        "What is DNS?",
+        "Count to five.",
+        "What is a pod?",
+        "Name an animal.",
+        "What is TCP?",
+        "Say something short.",
+    ]
+
+    # --------------- Stats ---------------
+    stats = {
+        "total_reqs": 0,
+        "total_errs": 0,
+        "total_tokens": 0,
+        "gpu_active_ms": 0,
+        "gpu_idle_ms": 0,
+        "latencies": deque(maxlen=200),
+    }
+
+    def wait_for_ollama():
+        print(f"[init] Waiting for Ollama at {OLLAMA_URL} ...")
+        while True:
+            try:
+                req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    data = json.loads(r.read())
+                    models = [m.get("name", "") for m in data.get("models", [])]
+                    if any(MODEL in m for m in models):
+                        print(f"[init] Model '{MODEL}' ready")
+                        return
+                    print(f"[init] Pulling '{MODEL}' ...")
+                    pull_payload = json.dumps({"name": MODEL}).encode()
+                    pr = urllib.request.Request(
+                        f"{OLLAMA_URL}/api/pull", data=pull_payload,
+                        headers={"Content-Type": "application/json"}, method="POST"
+                    )
+                    with urllib.request.urlopen(pr, timeout=600) as resp:
+                        for line in resp:
+                            s = json.loads(line.decode().strip())
+                            if "status" in s:
+                                print(f"  [pull] {s['status']}")
+                    print(f"[init] Pull complete")
+                    return
+            except Exception as e:
+                print(f"[init] Not ready: {e} (retrying 5s)")
+                time.sleep(5)
+
+    def send_request(prompt):
+        payload = json.dumps({
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "num_ctx": NUM_CTX,
+                "num_predict": MAX_TOKENS,
+            },
+        }).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = json.loads(resp.read())
+            latency_ms = (time.monotonic() - start) * 1000
+            tokens = body.get("eval_count", 0)
+            return latency_ms, tokens, None
+        except Exception as e:
+            latency_ms = (time.monotonic() - start) * 1000
+            return latency_ms, 0, str(e)
+
+    def calibrate():
+        """
+        Send a few warm-up requests and measure average inference time.
+        Use that to calculate the sleep gap needed for target utilization.
+
+        If inference takes T ms and we want U% utilization:
+          sleep = T * (1 - U) / U
+
+        Example: T=500ms, U=0.25 → sleep = 500 * 0.75 / 0.25 = 1500ms
+        """
+        print(f"\n[calibrate] Running {CALIBRATION_REQS} warm-up requests...")
+        latencies = []
+        for i in range(CALIBRATION_REQS):
+            prompt = random.choice(PROMPTS)
+            lat, tok, err = send_request(prompt)
+            if not err:
+                latencies.append(lat)
+                print(f"  [{i+1}/{CALIBRATION_REQS}] {lat:.0f}ms, {tok} tokens")
+            else:
+                print(f"  [{i+1}/{CALIBRATION_REQS}] ERROR: {err}")
+            time.sleep(0.5)
+
+        if not latencies:
+            print("[calibrate] All requests failed! Using default 3s sleep")
+            return 3.0
+
+        avg_latency_ms = sum(latencies) / len(latencies)
+        # duty cycle formula: sleep = active_time * (1 - target) / target
+        sleep_ms = avg_latency_ms * (1.0 - TARGET_UTIL) / TARGET_UTIL
+        sleep_sec = sleep_ms / 1000.0
+
+        print(f"\n[calibrate] Results:")
+        print(f"  Avg inference latency: {avg_latency_ms:.0f}ms")
+        print(f"  Target GPU util:       {TARGET_UTIL*100:.0f}%")
+        print(f"  Calculated sleep gap:  {sleep_sec:.2f}s")
+        print(f"  Expected duty cycle:   {avg_latency_ms:.0f}ms work / "
+              f"{sleep_ms:.0f}ms sleep\n")
+        return sleep_sec
+
+    def main():
+        print("=" * 60)
+        print("  Ollama Load Generator (Target <30% GR/SM)")
+        print("=" * 60)
+        print(f"  Ollama URL:      {OLLAMA_URL}")
+        print(f"  Model:           {MODEL}")
+        print(f"  Target GPU util: {TARGET_UTIL*100:.0f}%")
+        print(f"  Max tokens/req:  {MAX_TOKENS}")
+        print(f"  Context window:  {NUM_CTX}")
+        print("=" * 60)
+
+        wait_for_ollama()
+        sleep_gap = calibrate()
+
+        print("[run] Starting sustained load loop...\n")
+        last_log = time.monotonic()
+        start_time = time.monotonic()
+
+        while True:
+            prompt = random.choice(PROMPTS)
+            latency, tokens, error = send_request(prompt)
+
+            stats["total_reqs"] += 1
+            if error:
+                stats["total_errs"] += 1
+                print(f"[req] ERR | {latency:.0f}ms | {error[:50]}")
+            else:
+                stats["total_tokens"] += tokens
+                stats["latencies"].append(latency)
+                stats["gpu_active_ms"] += latency
+
+            # Sleep to create idle gap (this is what keeps SM < 30%)
+            time.sleep(sleep_gap)
+            stats["gpu_idle_ms"] += sleep_gap * 1000
+
+            # --- Periodic metrics ---
+            now = time.monotonic()
+            if now - last_log >= LOG_INTERVAL:
+                elapsed = now - start_time
+                lats = list(stats["latencies"])
+                active = stats["gpu_active_ms"]
+                total_ms = active + stats["gpu_idle_ms"]
+                actual_util = (active / total_ms * 100) if total_ms > 0 else 0
+
+                if lats:
+                    avg_lat = sum(lats) / len(lats)
+                    lats_s = sorted(lats)
+                    p50 = lats_s[len(lats_s) // 2]
+                    p95 = lats_s[int(len(lats_s) * 0.95)]
+                else:
+                    avg_lat = p50 = p95 = 0
+
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                print(
+                    f"\n{'='*65}\n"
+                    f"[metrics {ts}] uptime={elapsed:.0f}s\n"
+                    f"  requests: {stats['total_reqs']}  "
+                    f"errors: {stats['total_errs']}  "
+                    f"tokens: {stats['total_tokens']}\n"
+                    f"  latency:  avg={avg_lat:.0f}ms  p50={p50:.0f}ms  p95={p95:.0f}ms\n"
+                    f"  GPU duty: {actual_util:.1f}% "
+                    f"(target: {TARGET_UTIL*100:.0f}%) "
+                    f"[active={active/1000:.1f}s / total={total_ms/1000:.1f}s]\n"
+                    f"  sleep gap: {sleep_gap:.2f}s per request\n"
+                    f"{'='*65}\n"
+                )
+
+                # --- Auto-adjust sleep if drifting from target ---
+                if lats:
+                    new_avg = sum(lats[-20:]) / len(lats[-20:])
+                    ideal_sleep = (new_avg * (1.0 - TARGET_UTIL) / TARGET_UTIL) / 1000
+                    # Smooth adjustment (don't swing wildly)
+                    sleep_gap = sleep_gap * 0.7 + ideal_sleep * 0.3
+                    sleep_gap = max(sleep_gap, 0.1)  # floor at 100ms
+
+                last_log = now
+
+    if __name__ == "__main__":
+        main()
+
+---
+# --- Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-loadgen
+  namespace: ollama
+  labels:
+    app: ollama-loadgen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama-loadgen
+  template:
+    metadata:
+      labels:
+        app: ollama-loadgen
+    spec:
+      containers:
+        - name: loadgen
+          image: python:3.12-slim
+          command: ["python3", "-u", "/scripts/loadgen.py"]
+          env:
+            # ---- Main knob: target GPU utilization (0.0 - 1.0) ----
+            - name: TARGET_GPU_UTIL
+              value: "0.25"
+
+            # ---- Ollama settings ----
+            - name: OLLAMA_URL
+              value: "http://ollama.ollama.svc:11434"
+            - name: MODEL
+              value: "qwen3:0.6b"
+
+            # ---- Keep requests small for controlled bursts ----
+            - name: MAX_TOKENS
+              value: "30"
+            - name: NUM_CTX
+              value: "512"
+
+            # ---- Calibration & logging ----
+            - name: CALIBRATION_REQS
+              value: "5"
+            - name: LOG_INTERVAL
+              value: "10"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+      volumes:
+        - name: scripts
+          configMap:
+            name: ollama-loadgen
